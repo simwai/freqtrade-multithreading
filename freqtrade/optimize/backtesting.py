@@ -67,6 +67,12 @@ from freqtrade.util import FtPrecise
 from freqtrade.util.migrations import migrate_data
 from freqtrade.wallets import Wallets
 
+from freqtrade.util.perf import measure_duration
+from freqtrade.util.executor import select_parallel_mode, create_executor, ExecutionMode
+from freqtrade.util.concurrency_env import ConcurrencyEnvironment
+from freqtrade.util.benchmark_export import maybe_export_benchmark
+from freqtrade.optimize.job_spec import BacktestJobSpec
+from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +126,11 @@ class Backtesting:
         self.run_ids: Dict[str, str] = {}
         self.strategylist: List[IStrategy] = []
         self.all_results: Dict[str, Dict] = {}
-        self.loop = asyncio.get_event_loop()
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
         # TODO: asyncio: FIXME
         self.processed_dfs: Dict[str, Dict] = {}
         self.rejected_dict: Dict[str, List] = {}
@@ -1613,20 +1623,73 @@ class Backtesting:
         """
         Run backtesting end-to-end
         """
-        data: Dict[str, DataFrame] = {}
+        env = ConcurrencyEnvironment()
+        mode, workers = select_parallel_mode(self.config, env)
 
-        data, timerange = self.load_bt_data()
-        self.load_bt_data_detail()
-        logger.info("Dataload complete. Calculating indicators")
+        with measure_duration() as elapsed:
+            data: Dict[str, DataFrame] = {}
 
-        self.load_prior_backtest()
+            data, timerange = self.load_bt_data()
+            self.load_bt_data_detail()
+            logger.info("Dataload complete. Calculating indicators")
 
-        for strat in self.strategylist:
-            if self.results and strat.get_strategy_name() in self.results["strategy"]:
-                # When previous result hash matches - reuse that result and skip backtesting.
-                logger.info(f"Reusing result of previous backtest for {strat.get_strategy_name()}")
-                continue
-            min_date, max_date = self.backtest_one_strategy(strat, data, timerange)
+            self.load_prior_backtest()
+
+            if (mode == ExecutionMode.THREADS or mode == ExecutionMode.PROCESSES) and len(self.strategylist) > 1 and workers > 1:
+                # Parallelize across strategies
+                from freqtrade.optimize.job_spec import BacktestJobSpec
+                from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
+
+                data_ref = register_data("backtest-main", data)
+
+                timerange_str = self.config.get("timerange")
+                if timerange_str is not None:
+                    timerange_str = str(timerange_str)
+
+                job_specs = [
+                    BacktestJobSpec(
+                        strategy_name=strat.get_strategy_name(),
+                        parameters={},
+                        pair_list=self.pairlists.whitelist,
+                        timeframe=self.timeframe,
+                        timerange=timerange_str,
+                        data_ref=data_ref,
+                    )
+                    for strat in self.strategylist
+                    if not (self.results and strat.get_strategy_name() in self.results["strategy"])
+                ]
+
+                if job_specs:
+                    logger.info(f"Running backtesting for {len(job_specs)} strategies in parallel (mode={mode.value}, workers={workers})")
+                    with create_executor(mode, workers) as executor:
+                        # In THREAD mode, we can pass self.exchange. In PROCESS mode, we must not.
+                        exchange_to_pass = self.exchange if mode == ExecutionMode.THREADS else None
+                        futures = [executor.submit(run_single_backtest_job, j, self.config, exchange_to_pass) for j in job_specs]
+                        job_results = [f.result() for f in futures]
+
+                        # Integrate results back
+                        for res in job_results:
+                            self.all_results.update(res.results['all_results'])
+                            self.processed_dfs.update(res.results['processed_dfs'])
+                            self.rejected_df.update(res.results['rejected_df'])
+
+                min_date, max_date = history.get_timerange(data)
+
+            else:
+                # Sequential
+                for strat in self.strategylist:
+                    if self.results and strat.get_strategy_name() in self.results["strategy"]:
+                        # When previous result hash matches - reuse that result and skip backtesting.
+                        logger.info(f"Reusing result of previous backtest for {strat.get_strategy_name()}")
+                        continue
+                    min_date, max_date = self.backtest_one_strategy(strat, data, timerange)
+
+        duration = elapsed()
+        logger.info(
+            "Backtesting finished in %.3f seconds (mode=%s, workers=%d)",
+            duration, mode.value, workers,
+        )
+        maybe_export_benchmark("backtesting", duration, mode.value, workers, self.config)
 
         # Update old results with new ones.
         if len(self.all_results) > 0:

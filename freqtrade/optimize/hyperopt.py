@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import rapidjson
-from joblib import Parallel, cpu_count, delayed, dump, load, wrap_non_picklable_objects
+from joblib import cpu_count, dump, load
 from joblib.externals import cloudpickle
 from pandas import DataFrame
 from rich.align import Align
@@ -41,6 +41,13 @@ from freqtrade.optimize.hyperopt_tools import (
 from freqtrade.optimize.optimize_reports import generate_strategy_stats
 from freqtrade.resolvers.hyperopt_resolver import HyperOptLossResolver
 from freqtrade.util import get_progress_tracker
+
+from freqtrade.util.perf import measure_duration
+from freqtrade.util.executor import select_parallel_mode, create_executor, ExecutionMode
+from freqtrade.util.concurrency_env import ConcurrencyEnvironment
+from freqtrade.util.benchmark_export import maybe_export_benchmark
+from freqtrade.optimize.job_spec import BacktestJobSpec
+from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
 
 
 # Suppress scikit-learn FutureWarnings from skopt
@@ -473,12 +480,6 @@ class Hyperopt:
             model_queue_size=SKOPT_MODEL_QUEUE_SIZE,
         )
 
-    def run_optimizer_parallel(self, parallel: Parallel, asked: List[List]) -> List[Dict[str, Any]]:
-        """Start optimizer in a parallel way"""
-        return parallel(
-            delayed(wrap_non_picklable_objects(self.generate_optimizer))(v) for v in asked
-        )
-
     def _set_random_state(self, random_state: Optional[int]) -> int:
         return random_state or random.randint(1, 2**16 - 1)  # noqa: S311
 
@@ -486,7 +487,7 @@ class Hyperopt:
         preprocessed = self.backtesting.strategy.advise_all_indicators(data)
 
         # Trim startup period from analyzed dataframe to get correct dates for output.
-        # This is only used to keep track of min/max date after trimming.
+        # This is only used to determine if trimming would result in an empty dataframe
         # The result is NOT returned from this method, actual trimming happens in backtesting.
         trimmed = trim_dataframes(preprocessed, self.timerange, self.backtesting.required_startup)
         self.min_date, self.max_date = get_timerange(trimmed)
@@ -611,60 +612,106 @@ class Hyperopt:
         # self.backtesting.exchange = None  # type: ignore
         self.backtesting.pairlists = None  # type: ignore
 
+        env = ConcurrencyEnvironment()
+        mode, workers = select_parallel_mode(self.config, env)
+
         cpus = cpu_count()
         logger.info(f"Found {cpus} CPU cores. Let's make them scream!")
-        config_jobs = self.config.get("hyperopt_jobs", -1)
-        logger.info(f"Number of parallel jobs set as: {config_jobs}")
+        logger.info(f"Number of parallel jobs set as: {workers} (mode={mode.value})")
 
-        self.opt = self.get_optimizer(self.dimensions, config_jobs)
+        self.opt = self.get_optimizer(self.dimensions, workers)
 
-        try:
-            with Parallel(n_jobs=config_jobs) as parallel:
-                jobs = parallel._effective_n_jobs()
-                logger.info(f"Effective number of parallel workers used: {jobs}")
-                console = Console(
-                    color_system="auto" if self.print_colorized else None,
-                )
+        with measure_duration() as elapsed:
+            try:
+                with create_executor(mode, workers) as executor:
+                    console = Console(
+                        color_system="auto" if self.print_colorized else None,
+                    )
 
-                # Define progressbar
-                with get_progress_tracker(
-                    console=console,
-                    cust_objs=[Align.center(self._hyper_out.table)],
-                ) as pbar:
-                    task = pbar.add_task("Epochs", total=self.total_epochs)
+                    # Define progressbar
+                    with get_progress_tracker(
+                        console=console,
+                        cust_objs=[Align.center(self._hyper_out.table)],
+                    ) as pbar:
+                        task = pbar.add_task("Epochs", total=self.total_epochs)
 
-                    start = 0
+                        start = 0
 
-                    if self.analyze_per_epoch:
-                        # First analysis not in parallel mode when using --analyze-per-epoch.
-                        # This allows dataprovider to load it's informative cache.
-                        asked, is_random = self.get_asked_points(n_points=1)
-                        f_val0 = self.generate_optimizer(asked[0])
-                        self.opt.tell(asked, [f_val0["loss"]])
-                        self.evaluate_result(f_val0, 1, is_random[0])
-                        pbar.update(task, advance=1)
-                        start += 1
-
-                    evals = ceil((self.total_epochs - start) / jobs)
-                    for i in range(evals):
-                        # Correct the number of epochs to be processed for the last
-                        # iteration (should not exceed self.total_epochs in total)
-                        n_rest = (i + 1) * jobs - (self.total_epochs - start)
-                        current_jobs = jobs - n_rest if n_rest > 0 else jobs
-
-                        asked, is_random = self.get_asked_points(n_points=current_jobs)
-                        f_val = self.run_optimizer_parallel(parallel, asked)
-                        self.opt.tell(asked, [v["loss"] for v in f_val])
-
-                        for j, val in enumerate(f_val):
-                            # Use human-friendly indexes here (starting from 1)
-                            current = i * jobs + j + 1 + start
-
-                            self.evaluate_result(val, current, is_random[j])
+                        if self.analyze_per_epoch:
+                            # First analysis not in parallel mode when using --analyze-per-epoch.
+                            # This allows dataprovider to load it's informative cache.
+                            asked, is_random = self.get_asked_points(n_points=1)
+                            f_val0 = self.generate_optimizer(asked[0])
+                            self.opt.tell(asked, [f_val0["loss"]])
+                            self.evaluate_result(f_val0, 1, is_random[0])
                             pbar.update(task, advance=1)
+                            start += 1
 
-        except KeyboardInterrupt:
-            print("User interrupted..")
+                        evals = ceil((self.total_epochs - start) / workers)
+
+                        # Register data for workers
+                        if mode == ExecutionMode.THREADS:
+                            # In thread mode, we can just register the path or the data.
+                            # Since run_single_backtest_job handles both, we'll register the path
+                            # to be consistent, but we could also register the actual data.
+                            data_ref = register_data("hyperopt-data", str(self.data_pickle_file))
+                        else:
+                            # In process mode, we pass the path
+                            data_ref = str(self.data_pickle_file)
+
+                        for i in range(evals):
+                            # Correct the number of epochs to be processed for the last
+                            # iteration (should not exceed self.total_epochs in total)
+                            n_rest = (i + 1) * workers - (self.total_epochs - start)
+                            current_jobs = workers - n_rest if n_rest > 0 else workers
+
+                            asked, is_random = self.get_asked_points(n_points=current_jobs)
+
+                            timerange_str = self.config.get("timerange")
+                            if timerange_str is None:
+                                timerange_str = f"{self.min_date.strftime('%Y%m%d')}-{self.max_date.strftime('%Y%m%d')}"
+                            else:
+                                timerange_str = str(timerange_str)
+
+                            job_specs = [
+                                BacktestJobSpec(
+                                    strategy_name=self.backtesting.strategy.get_strategy_name(),
+                                    parameters=self._get_params_dict(self.dimensions, raw_params),
+                                    pair_list=self.pairlist,
+                                    timeframe=self.backtesting.timeframe,
+                                    timerange=timerange_str,
+                                    data_ref=data_ref,
+                                    extra_context={
+                                        'is_hyperopt': True,
+                                        'analyze_per_epoch': self.analyze_per_epoch,
+                                        'market_change': self.market_change,
+                                    }
+                                )
+                                for raw_params in asked
+                            ]
+
+                            exchange_to_pass = self.backtesting.exchange if mode == ExecutionMode.THREADS else None
+                            futures = [executor.submit(run_single_backtest_job, j, self.config, exchange_to_pass) for j in job_specs]
+                            job_results = [f.result() for f in futures]
+                            f_val = [res.metrics for res in job_results]
+
+                            self.opt.tell(asked, [v["loss"] for v in f_val])
+
+                            for j, val in enumerate(f_val):
+                                # Use human-friendly indexes here (starting from 1)
+                                current = i * workers + j + 1 + start
+
+                                self.evaluate_result(val, current, is_random[j])
+                                pbar.update(task, advance=1)
+
+            except KeyboardInterrupt:
+                print("User interrupted..")
+
+        duration = elapsed()
+        logger.info(
+            f"Hyperopt finished in {duration:.3f} seconds (mode={mode.value}, workers={workers})"
+        )
+        maybe_export_benchmark("hyperopt", duration, mode.value, workers, self.config)
 
         logger.info(
             f"{self.num_epochs_saved} {plural(self.num_epochs_saved, 'epoch')} "
