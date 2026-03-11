@@ -42,7 +42,6 @@ def run_single_backtest_job(
     from freqtrade.optimize.hyperopt_tools import HyperoptTools
     from freqtrade.resolvers.hyperopt_resolver import HyperOptLossResolver
     from freqtrade.optimize.optimize_reports import generate_strategy_stats
-    from freqtrade.misc import deep_merge_dicts
     from freqtrade.optimize.backtest_caching import get_strategy_run_id
     import joblib
 
@@ -79,33 +78,33 @@ def run_single_backtest_job(
     is_hyperopt = job.extra_context and job.extra_context.get('is_hyperopt')
 
     if is_hyperopt:
+        from freqtrade.optimize.hyperopt_auto import HyperOptAuto
+        custom_hyperopt = HyperOptAuto(job_config)
+        custom_hyperopt.strategy = strat
+
         params_dict = job.parameters
         # Similar logic to Hyperopt.generate_optimizer
         if HyperoptTools.has_space(job_config, "buy"):
             for attr_name, attr in strat.enumerate_parameters("buy"):
-                if attr.optimize:
+                if attr.optimize and attr_name in params_dict:
                     attr.value = params_dict[attr_name]
         if HyperoptTools.has_space(job_config, "sell"):
             for attr_name, attr in strat.enumerate_parameters("sell"):
-                if attr.optimize:
+                if attr.optimize and attr_name in params_dict:
                     attr.value = params_dict[attr_name]
         if HyperoptTools.has_space(job_config, "protection"):
             for attr_name, attr in strat.enumerate_parameters("protection"):
-                if attr.optimize:
+                if attr.optimize and attr_name in params_dict:
                     attr.value = params_dict[attr_name]
 
         if HyperoptTools.has_space(job_config, "roi"):
-            # We need the custom_hyperopt instance or just generate it here
-            from freqtrade.optimize.hyperopt_auto import HyperOptAuto
-            custom_hyperopt = HyperOptAuto(job_config)
             strat.minimal_roi = custom_hyperopt.generate_roi_table(params_dict)
 
         if HyperoptTools.has_space(job_config, "stoploss"):
-            strat.stoploss = params_dict["stoploss"]
+            if "stoploss" in params_dict:
+                strat.stoploss = params_dict["stoploss"]
 
         if HyperoptTools.has_space(job_config, "trailing"):
-            from freqtrade.optimize.hyperopt_auto import HyperOptAuto
-            custom_hyperopt = HyperOptAuto(job_config)
             d = custom_hyperopt.generate_trailing_params(params_dict)
             strat.trailing_stop = d["trailing_stop"]
             strat.trailing_stop_positive = d["trailing_stop_positive"]
@@ -113,13 +112,14 @@ def run_single_backtest_job(
             strat.trailing_only_offset_is_reached = d["trailing_only_offset_is_reached"]
 
         if HyperoptTools.has_space(job_config, "trades"):
-            updated_max_open_trades = (
-                int(params_dict["max_open_trades"])
-                if (params_dict["max_open_trades"] != -1 and params_dict["max_open_trades"] != 0)
-                else float("inf")
-            )
-            strat.max_open_trades = updated_max_open_trades
-            job_config["max_open_trades"] = updated_max_open_trades
+            if "max_open_trades" in params_dict:
+                updated_max_open_trades = (
+                    int(params_dict["max_open_trades"])
+                    if (params_dict["max_open_trades"] != -1 and params_dict["max_open_trades"] != 0)
+                    else float("inf")
+                )
+                strat.max_open_trades = updated_max_open_trades
+                job_config["max_open_trades"] = updated_max_open_trades
 
         # Handle analyze_per_epoch if needed
         if job.extra_context.get('analyze_per_epoch'):
@@ -176,18 +176,9 @@ def run_single_backtest_job(
                 backtest_stats=strat_stats,
             )
 
-        # Prepare params_details and params_not_optimized
-        from freqtrade.optimize.hyperopt_auto import HyperOptAuto
-        custom_hyperopt = HyperOptAuto(job_config)
-        # Note: This is slightly simplified as we don't have the full Hyperopt instance here
-        # but params_dict already has what's needed.
-
         results_explanation = HyperoptTools.format_results_explanation_string(
             strat_stats, job_config["stake_currency"]
         )
-
-        not_optimized = strat.get_no_optimize_params()
-        # simplified not_optimized details
 
         return BacktestResult(
             job=job,
