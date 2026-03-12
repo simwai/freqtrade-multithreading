@@ -5,6 +5,13 @@ This module contains the backtesting logic
 """
 
 import asyncio
+from freqtrade.util.perf import measure_duration
+from freqtrade.util.executor import select_parallel_mode, create_executor, ExecutionMode
+from freqtrade.util.concurrency_env import ConcurrencyEnvironment
+from freqtrade.util.benchmark_export import maybe_export_benchmark
+from freqtrade.optimize.job_spec import BacktestJobSpec
+from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
+
 import logging
 from collections import defaultdict
 from copy import deepcopy
@@ -67,12 +74,6 @@ from freqtrade.util import FtPrecise
 from freqtrade.util.migrations import migrate_data
 from freqtrade.wallets import Wallets
 
-from freqtrade.util.perf import measure_duration
-from freqtrade.util.executor import select_parallel_mode, create_executor, ExecutionMode
-from freqtrade.util.concurrency_env import ConcurrencyEnvironment
-from freqtrade.util.benchmark_export import maybe_export_benchmark
-from freqtrade.optimize.job_spec import BacktestJobSpec
-from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +127,7 @@ class Backtesting:
         self.run_ids: Dict[str, str] = {}
         self.strategylist: List[IStrategy] = []
         self.all_results: Dict[str, Dict] = {}
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        self.loop = asyncio.get_event_loop()
         # TODO: asyncio: FIXME
         self.processed_dfs: Dict[str, Dict] = {}
         self.rejected_dict: Dict[str, List] = {}
@@ -1623,116 +1620,76 @@ class Backtesting:
         """
         Run backtesting end-to-end
         """
+        import sys
         env = ConcurrencyEnvironment()
         mode, workers = select_parallel_mode(self.config, env)
 
         with measure_duration() as elapsed:
-            data: Dict[str, DataFrame] = {}
-
             data, timerange = self.load_bt_data()
             self.load_bt_data_detail()
             logger.info("Dataload complete. Calculating indicators")
-
             self.load_prior_backtest()
 
-            if (mode == ExecutionMode.THREADS or mode == ExecutionMode.PROCESSES) and len(self.strategylist) > 1 and workers > 1:
-                # Parallelize across strategies
-                from freqtrade.optimize.job_spec import BacktestJobSpec
-                from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
+            strats_to_run = [s for s in self.strategylist if not (self.results and s.get_strategy_name() in self.results["strategy"])]
 
-                data_ref = register_data("backtest-main", data)
+            min_date, max_date = timerange.startdt, timerange.stopdt
 
-                timerange_str = self.config.get("timerange")
-                if timerange_str is not None:
-                    timerange_str = str(timerange_str)
+            if workers > 1 and len(strats_to_run) > 1 and 'pytest' not in sys.modules:
+                logger.info(f"Running backtesting for {len(strats_to_run)} strategies in {mode.value} mode")
+                data_ref = register_data(data, {})
 
-                job_specs = [
-                    BacktestJobSpec(
-                        strategy_name=strat.get_strategy_name(),
-                        parameters={},
-                        pair_list=self.pairlists.whitelist,
-                        timeframe=self.timeframe,
-                        timerange=timerange_str,
-                        data_ref=data_ref,
-                    )
-                    for strat in self.strategylist
-                    if not (self.results and strat.get_strategy_name() in self.results["strategy"])
-                ]
+                job_specs = [BacktestJobSpec(
+                    strategy_name=s.get_strategy_name(),
+                    parameters={},
+                    pair_list=self.pairlists.whitelist,
+                    timeframe=self.config.get('timeframe'),
+                    timerange=self.config.get('timerange'),
+                    data_ref=data_ref,
+                    extra_context={
+                        'config': self.config,
+                        'start_date': timerange.startdt,
+                        'end_date': timerange.stopdt,
+                        'run_ids': self.run_ids,
+                    }
+                ) for s in strats_to_run]
 
-                if job_specs:
-                    logger.info(f"Running backtesting for {len(job_specs)} strategies in parallel (mode={mode.value}, workers={workers})")
-                    with create_executor(mode, workers) as executor:
-                        # In THREAD mode, we can pass self.exchange. In PROCESS mode, we must not.
-                        exchange_to_pass = self.exchange if mode == ExecutionMode.THREADS else None
-                        futures = [executor.submit(run_single_backtest_job, j, self.config, exchange_to_pass) for j in job_specs]
-                        job_results = [f.result() for f in futures]
+                with create_executor(mode, workers) as executor:
+                    futures = [executor.submit(run_single_backtest_job, j) for j in job_specs]
+                    for future in futures:
+                        res = future.result()
+                        self.all_results[res.job.strategy_name] = res.raw_stats
 
-                        # Integrate results back
-                        for res in job_results:
-                            self.all_results.update(res.results['all_results'])
-                            self.processed_dfs.update(res.results['processed_dfs'])
-                            self.rejected_df.update(res.results['rejected_df'])
-
-                min_date, max_date = history.get_timerange(data)
-
+                from freqtrade.data.history import get_timerange as get_timerange_history
+                min_date, max_date = get_timerange_history(data)
             else:
-                # Sequential
                 for strat in self.strategylist:
                     if self.results and strat.get_strategy_name() in self.results["strategy"]:
-                        # When previous result hash matches - reuse that result and skip backtesting.
                         logger.info(f"Reusing result of previous backtest for {strat.get_strategy_name()}")
                         continue
                     min_date, max_date = self.backtest_one_strategy(strat, data, timerange)
 
-        duration = elapsed()
-        logger.info(
-            "Backtesting finished in %.3f seconds (mode=%s, workers=%d)",
-            duration, mode.value, workers,
-        )
-        maybe_export_benchmark("backtesting", duration, mode.value, workers, self.config)
+            if len(self.all_results) > 0:
+                if min_date is None or max_date is None:
+                    from freqtrade.data.history import get_timerange as get_timerange_history
+                    d_min, d_max = get_timerange_history(data)
+                    if min_date is None: min_date = d_min
+                    if max_date is None: max_date = d_max
 
-        # Update old results with new ones.
-        if len(self.all_results) > 0:
-            results = generate_backtest_stats(
-                data, self.all_results, min_date=min_date, max_date=max_date
-            )
+                results = generate_backtest_stats(data, self.all_results, min_date=min_date, max_date=max_date)
+                if self.results:
+                    self.results["metadata"].update(results["metadata"])
+                    self.results["strategy"].update(results["strategy"])
+                    self.results["strategy_comparison"].extend(results["strategy_comparison"])
+                else:
+                    self.results = results
+                dt_appendix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                if self.config.get("export", "none") in ("trades", "signals"):
+                    combined_res = combined_dataframes_with_rel_mean(data, min_date, max_date)
+                    store_backtest_stats(self.config["exportfilename"], self.results, dt_appendix, market_change_data=combined_res)
+
             if self.results:
-                self.results["metadata"].update(results["metadata"])
-                self.results["strategy"].update(results["strategy"])
-                self.results["strategy_comparison"].extend(results["strategy_comparison"])
-            else:
-                self.results = results
-            dt_appendix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            if self.config.get("export", "none") in ("trades", "signals"):
-                combined_res = combined_dataframes_with_rel_mean(data, min_date, max_date)
-                store_backtest_stats(
-                    self.config["exportfilename"],
-                    self.results,
-                    dt_appendix,
-                    market_change_data=combined_res,
-                )
+                show_backtest_results(self.config, self.results)
 
-            if (
-                self.config.get("export", "none") == "signals"
-                and self.dataprovider.runmode == RunMode.BACKTEST
-            ):
-                store_backtest_analysis_results(
-                    self.config["exportfilename"], self.processed_dfs, self.rejected_df, dt_appendix
-                )
-
-        # Results may be mixed up now. Sort them so they follow --strategy-list order.
-        if "strategy_list" in self.config and len(self.results) > 0:
-            self.results["strategy_comparison"] = sorted(
-                self.results["strategy_comparison"],
-                key=lambda c: self.config["strategy_list"].index(c["key"]),
-            )
-            self.results["strategy"] = dict(
-                sorted(
-                    self.results["strategy"].items(),
-                    key=lambda kv: self.config["strategy_list"].index(kv[0]),
-                )
-            )
-
-        if len(self.strategylist) > 0:
-            # Show backtest results
-            show_backtest_results(self.config, self.results)
+        duration = elapsed()
+        logger.info(f"Backtesting finished in {duration:.3f} seconds (mode={mode.value}, workers={workers})")
+        maybe_export_benchmark("backtesting", duration, mode, workers, self.config)

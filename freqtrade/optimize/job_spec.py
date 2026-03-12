@@ -1,21 +1,17 @@
-from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
-
-
+from dataclasses import dataclass, field
+from typing import Mapping, Any, Sequence, Optional
 @dataclass(frozen=True)
 class BacktestJobSpec:
     strategy_name: str
     parameters: Mapping[str, Any]
     pair_list: Sequence[str]
     timeframe: str
-    timerange: Optional[str]  # Changed to Optional
-    data_ref: str  # key/id used to resolve data
-    extra_context: Optional[Mapping[str, Any]] = None
-
-
+    timerange: str
+    data_ref: str
+    extra_context: Mapping[str, Any] = field(default_factory=dict)
 @dataclass
 class BacktestResult:
     job: BacktestJobSpec
-    metrics: Mapping[str, Any]  # profit, sharpe, drawdown, etc.
+    metrics: Mapping[str, float]
     trades_count: int
-    results: Any = None  # Full results dataframe or similar
+    raw_stats: Optional[Mapping[str, Any]] = None
