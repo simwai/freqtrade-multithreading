@@ -1632,7 +1632,10 @@ class Backtesting:
 
             strats_to_run = [s for s in self.strategylist if not (self.results and s.get_strategy_name() in self.results["strategy"])]
 
-            min_date, max_date = timerange.startdt, timerange.stopdt
+            if hasattr(timerange, "startdt"):
+                min_date, max_date = timerange.startdt, timerange.stopdt
+            else:
+                min_date, max_date = timerange.startdt, timerange.stopdt
 
             if workers > 1 and len(strats_to_run) > 1 and 'pytest' not in sys.modules:
                 logger.info(f"Running backtesting for {len(strats_to_run)} strategies in {mode.value} mode")
@@ -1685,7 +1688,36 @@ class Backtesting:
                 dt_appendix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 if self.config.get("export", "none") in ("trades", "signals"):
                     combined_res = combined_dataframes_with_rel_mean(data, min_date, max_date)
-                    store_backtest_stats(self.config["exportfilename"], self.results, dt_appendix, market_change_data=combined_res)
+                    store_backtest_stats(
+                        self.config["exportfilename"],
+                        self.results,
+                        dt_appendix,
+                        market_change_data=combined_res,
+                    )
+
+                if (
+                    self.config.get("export", "none") == "signals"
+                    and self.dataprovider.runmode == RunMode.BACKTEST
+                ):
+                    store_backtest_analysis_results(
+                        self.config["exportfilename"],
+                        self.processed_dfs,
+                        self.rejected_df,
+                        dt_appendix,
+                    )
+
+            # Results may be mixed up now. Sort them so they follow --strategy-list order.
+            if "strategy_list" in self.config and len(self.results) > 0:
+                self.results["strategy_comparison"] = sorted(
+                    self.results["strategy_comparison"],
+                    key=lambda c: self.config["strategy_list"].index(c["key"]),
+                )
+                self.results["strategy"] = dict(
+                    sorted(
+                        self.results["strategy"].items(),
+                        key=lambda kv: self.config["strategy_list"].index(kv[0]),
+                    )
+                )
 
             if self.results:
                 show_backtest_results(self.config, self.results)

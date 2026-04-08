@@ -1,10 +1,11 @@
 from freqtrade.enums import BacktestState
+from freqtrade.util.thread_local import ThreadLocalDescriptor
 
 
 class BTProgress:
-    _action: BacktestState = BacktestState.STARTUP
-    _progress: float = 0
-    _max_steps: float = 0
+    _action = ThreadLocalDescriptor(lambda: BacktestState.STARTUP)
+    _progress = ThreadLocalDescriptor(float)
+    _max_steps = ThreadLocalDescriptor(float)
 
     def __init__(self):
         pass

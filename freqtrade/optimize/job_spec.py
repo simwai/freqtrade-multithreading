@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Mapping, Any, Sequence, Optional
+
 @dataclass(frozen=True)
 class BacktestJobSpec:
     strategy_name: str
@@ -9,6 +10,7 @@ class BacktestJobSpec:
     timerange: str
     data_ref: str
     extra_context: Mapping[str, Any] = field(default_factory=dict)
+
 @dataclass
 class BacktestResult:
     job: BacktestJobSpec

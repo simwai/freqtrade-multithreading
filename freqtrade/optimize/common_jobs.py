@@ -21,6 +21,11 @@ def get_data_from_registry(data_ref):
 def run_single_backtest_job(job: BacktestJobSpec) -> BacktestResult:
     from freqtrade.optimize.backtesting import Backtesting
     from freqtrade.enums import BacktestState
+    from freqtrade.persistence import LocalTrade, PairLocks
+
+    # Isolate backtesting state for this thread
+    LocalTrade.reset_trades()
+    PairLocks.reset_locks()
 
     config = job.extra_context.get("config", {}).copy()
     config.update({
@@ -29,6 +34,7 @@ def run_single_backtest_job(job: BacktestJobSpec) -> BacktestResult:
         "timerange": job.timerange
     })
 
+    # Ensure strategy paths are in sys.path for worker
     for path_key in ["user_data_dir", "extra_strat_path"]:
         if path := config.get(path_key):
             p = Path(path)
@@ -36,11 +42,13 @@ def run_single_backtest_job(job: BacktestJobSpec) -> BacktestResult:
             if p.exists() and str(p) not in sys.path:
                 sys.path.insert(0, str(p))
 
-    _, processed = get_data_from_registry(job.data_ref)
+    # Get data from registry
+    data, processed = get_data_from_registry(job.data_ref)
 
     bt = Backtesting(config)
     bt.progress.init_step(BacktestState.BACKTEST, 0)
 
+    # Apply parameters
     if job.parameters:
         for k, v in job.parameters.items():
             if hasattr(bt.strategy, k):
@@ -48,8 +56,16 @@ def run_single_backtest_job(job: BacktestJobSpec) -> BacktestResult:
                 if hasattr(attr, 'value'): attr.value = v
                 else: setattr(bt.strategy, k, v)
 
-    if processed is None:
-        data, _ = bt.load_bt_data()
+        # Special hyperopt parameters
+        if 'minimal_roi' in job.parameters:
+            bt.strategy.minimal_roi = job.parameters['minimal_roi']
+        if 'stoploss' in job.parameters:
+            bt.strategy.stoploss = job.parameters['stoploss']
+
+    # Handle analyze_per_epoch equivalent
+    if processed is None or job.extra_context.get("analyze_per_epoch"):
+        if data is None:
+            data, _ = bt.load_bt_data()
         processed = bt.strategy.advise_all_indicators(data)
 
     backtest_start_time = datetime.now(timezone.utc)
