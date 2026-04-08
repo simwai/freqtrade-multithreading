@@ -336,7 +336,7 @@ async def test_refresh_pairlist_dynamic_2(mocker, shitcoinmarkets, tickers_base,
     assert whitelist == freqtrade.pairlists.whitelist
 
     # Delay to allow 0 TTL cache to expire...
-    time.sleep(1)
+    time.sleep(1)  # noqa: ASYNC251
     whitelist = ["FUEL/BTC", "ETH/BTC", "TKN/BTC", "LTC/BTC", "XRP/BTC"]
     tickers_base["FUEL/BTC"]["quoteVolume"] = 10000.0
     await freqtrade.pairlists.refresh_pairlist()

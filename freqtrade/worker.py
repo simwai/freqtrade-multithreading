@@ -200,7 +200,7 @@ class Worker:
             await self.freqtrade.process()
         except TemporaryError as error:
             logger.warning(f"Error: {error}, retrying in {RETRY_TIMEOUT} seconds...")
-            time.sleep(RETRY_TIMEOUT)
+            await self._sleep(RETRY_TIMEOUT)
         except OperationalException:
             tb = traceback.format_exc()
             hint = "Issue `/start` if you think it is safe to restart."

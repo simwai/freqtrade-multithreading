@@ -240,7 +240,7 @@ class RemotePairList(IPairList):
                 file_path = Path(filename)
 
                 if file_path.exists():
-                    with file_path.open() as json_file:
+                    with file_path.open() as json_file:  # noqa: ASYNC230
                         try:
                             # Load the JSON data into a dictionary
                             jsonparse = rapidjson.load(json_file, parse_mode=CONFIG_PARSE_MODE)
