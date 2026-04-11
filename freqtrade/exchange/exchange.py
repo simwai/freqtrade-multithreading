@@ -2720,7 +2720,7 @@ class Exchange:
             self._trades[(pair, timeframe, c_type)] = trades_df
         return trades_df
 
-    async def refresh_latest_trades(
+    def refresh_latest_trades(
         self,
         pair_list: ListPairsWithTimeframes,
         *,
@@ -2793,7 +2793,7 @@ class Exchange:
                                 )
 
                     # from_id overrules with exchange set to id paginate
-                    [_, new_ticks] = await self.get_historic_trades(
+                    [_, new_ticks] = self.get_historic_trades(
                         pair,
                         since=since_ms if since_ms else first_candle_ms,
                         until=until,

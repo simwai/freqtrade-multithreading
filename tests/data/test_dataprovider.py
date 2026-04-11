@@ -9,7 +9,7 @@ from freqtrade.data.dataprovider import DataProvider
 from freqtrade.enums import CandleType, RunMode
 from freqtrade.exceptions import ExchangeError, OperationalException
 from freqtrade.plugins.pairlistmanager import PairListManager
-from tests.conftest import EXMS, generate_test_data, get_patched_exchange
+from tests.conftest import EXMS, generate_test_data, get_mock_coro, get_patched_exchange
 
 
 @pytest.mark.parametrize(

@@ -558,7 +558,7 @@ class FreqtradeBot(LoggingMixin):
                             f"Removing {trade} from database."
                         )
 
-                        await self._notify_enter_cancel(
+                        self._notify_enter_cancel(
                             trade,
                             order_type=self.strategy.order_types["entry"],
                             reason=constants.CANCEL_REASON["FULLY_CANCELLED"],
@@ -721,7 +721,7 @@ class FreqtradeBot(LoggingMixin):
             # TODO Remove to allow mul open orders
             if not trade.has_open_orders:
                 # Do a wallets update (will be ratelimited to once per hour)
-                await self.wallets.update(False)
+                self.wallets.update(False)
                 try:
                     await self.check_and_call_adjust_trade_position(trade)
                 except DependencyException as exception:

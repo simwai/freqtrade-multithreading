@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import time
 from copy import deepcopy
 from datetime import timedelta
 from typing import List
@@ -72,7 +73,7 @@ def patch_RPCManager(mocker) -> MagicMock:
     :param mocker: mocker to patch RPCManager class
     :return: RPCManager.send_msg MagicMock to track if this method is called
     """
-
+    mocker.patch("freqtrade.rpc.telegram.Telegram", MagicMock())
     rpc_mock = mocker.patch("freqtrade.freqtradebot.RPCManager.send_msg", MagicMock())
     return rpc_mock
 
@@ -730,7 +731,7 @@ async def test_process_exchange_failures(default_conf_usdt, ticker_usdt, mocker)
         reload_markets=MagicMock(),
         create_order=MagicMock(side_effect=TemporaryError),
     )
-    sleep_mock = mocker.patch("freqtrade.worker.Worker._sleep", AsyncMock())
+    sleep_mock = mocker.patch("time.sleep")
 
     worker = await get_patched_worker(mocker, default_conf_usdt)
     patch_get_signal(worker.freqtrade)

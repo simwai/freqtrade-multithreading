@@ -212,7 +212,7 @@ async def test_init_apiserver_enabled(mocker, default_conf, caplog) -> None:
     rpc_manager = RPCManager(await get_patched_freqtradebot(mocker, default_conf))
 
     # Sleep to allow the thread to start
-    time.sleep(0.5)  # noqa: ASYNC251
+    time.sleep(0.5)
     assert log_has("Enabling rpc.api_server", caplog)
     assert len(rpc_manager.registered_modules) == 1
     assert "apiserver" in [mod.name for mod in rpc_manager.registered_modules]
