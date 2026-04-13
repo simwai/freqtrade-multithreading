@@ -4,6 +4,7 @@ This module contains the class to persist trades into SQLite
 
 import logging
 from collections import defaultdict
+from freqtrade.util.thread_local import ThreadLocalDescriptor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isclose
@@ -373,13 +374,13 @@ class LocalTrade:
 
     use_db: bool = False
     # Trades container for backtesting
-    trades: List["LocalTrade"] = []
-    trades_open: List["LocalTrade"] = []
+    trades = ThreadLocalDescriptor(list)
+    trades_open = ThreadLocalDescriptor(list)
     # Copy of trades_open - but indexed by pair
-    bt_trades_open_pp: Dict[str, List["LocalTrade"]] = defaultdict(list)
-    bt_open_open_trade_count: int = 0
-    total_profit: float = 0
-    realized_profit: float = 0
+    bt_trades_open_pp = ThreadLocalDescriptor(lambda: defaultdict(list))
+    bt_open_open_trade_count = ThreadLocalDescriptor(int)
+    total_profit = ThreadLocalDescriptor(float)
+    realized_profit = ThreadLocalDescriptor(float)
 
     id: int = 0
 

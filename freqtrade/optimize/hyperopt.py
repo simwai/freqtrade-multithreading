@@ -5,6 +5,13 @@ This module contains the hyperopt logic
 """
 
 import logging
+from freqtrade.util.perf import measure_duration
+from freqtrade.util.executor import select_parallel_mode, create_executor, ExecutionMode
+from freqtrade.util.concurrency_env import ConcurrencyEnvironment
+from freqtrade.util.benchmark_export import maybe_export_benchmark
+from freqtrade.optimize.job_spec import BacktestJobSpec
+from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
+
 import random
 import sys
 import warnings
@@ -62,6 +69,29 @@ MAX_LOSS = 100000  # just a big enough number to be bad result in loss optimizat
 
 
 class Hyperopt:
+
+    def run_optimizer_parallel(self, asked: List[List[Any]], mode: ExecutionMode, workers: int) -> List[Dict[str, Any]]:
+        from freqtrade.optimize.common_jobs import run_single_backtest_job
+        if workers == 1 or 'pytest' in sys.modules:
+            return [self.generate_optimizer(a) for a in asked]
+
+        job_specs = [BacktestJobSpec(
+            strategy_name=self.config.get('strategy'),
+            parameters=self._get_params_dict(self.dimensions, a),
+            pair_list=self.pairlist,
+            timeframe=self.config.get('timeframe'),
+            timerange=self.config.get('timerange'),
+            data_ref=getattr(self, '_data_ref', ''),
+            extra_context={
+                'config': self.config,
+                'start_date': self.min_date,
+                'end_date': self.max_date,
+            }
+        ) for a in asked]
+        with create_executor(mode, workers) as executor:
+            futures = [executor.submit(run_single_backtest_job, j) for j in job_specs]
+            brs = [f.result() for f in futures]
+        return [r.raw_stats for r in brs]
     """
     Hyperopt class, this class contains all the logic to run a hyperopt simulation
 
@@ -473,11 +503,6 @@ class Hyperopt:
             model_queue_size=SKOPT_MODEL_QUEUE_SIZE,
         )
 
-    def run_optimizer_parallel(self, parallel: Parallel, asked: List[List]) -> List[Dict[str, Any]]:
-        """Start optimizer in a parallel way"""
-        return parallel(
-            delayed(wrap_non_picklable_objects(self.generate_optimizer))(v) for v in asked
-        )
 
     def _set_random_state(self, random_state: Optional[int]) -> int:
         return random_state or random.randint(1, 2**16 - 1)  # noqa: S311
@@ -592,7 +617,10 @@ class Hyperopt:
         self._save_result(val)
 
     def start(self) -> None:
-        self.random_state = self._set_random_state(self.config.get("hyperopt_random_state"))
+        env = ConcurrencyEnvironment()
+        mode, workers = select_parallel_mode(self.config, env)
+        with measure_duration() as elapsed:
+            self.random_state = self._set_random_state(self.config.get("hyperopt_random_state"))
         logger.info(f"Using optimizer random state: {self.random_state}")
         self.hyperopt_table_header = -1
         # Initialize spaces ...
@@ -619,8 +647,8 @@ class Hyperopt:
         self.opt = self.get_optimizer(self.dimensions, config_jobs)
 
         try:
-            with Parallel(n_jobs=config_jobs) as parallel:
-                jobs = parallel._effective_n_jobs()
+            if True: # with Parallel(...)
+                jobs = workers
                 logger.info(f"Effective number of parallel workers used: {jobs}")
                 console = Console(
                     color_system="auto" if self.print_colorized else None,
@@ -653,7 +681,7 @@ class Hyperopt:
                         current_jobs = jobs - n_rest if n_rest > 0 else jobs
 
                         asked, is_random = self.get_asked_points(n_points=current_jobs)
-                        f_val = self.run_optimizer_parallel(parallel, asked)
+                        f_val = self.run_optimizer_parallel(asked, mode, workers)
                         self.opt.tell(asked, [v["loss"] for v in f_val])
 
                         for j, val in enumerate(f_val):
@@ -688,3 +716,7 @@ class Hyperopt:
             # This is printed when Ctrl+C is pressed quickly, before first epochs have
             # a chance to be evaluated.
             print("No epochs evaluated yet, no best result.")
+
+        duration = elapsed()
+        logger.info(f"Hyperopt finished in {duration:.3f} seconds (mode={mode.value}, workers={workers})")
+        maybe_export_benchmark("hyperopt", duration, mode, workers, self.config)

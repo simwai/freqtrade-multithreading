@@ -5,6 +5,13 @@ This module contains the backtesting logic
 """
 
 import asyncio
+from freqtrade.util.perf import measure_duration
+from freqtrade.util.executor import select_parallel_mode, create_executor, ExecutionMode
+from freqtrade.util.concurrency_env import ConcurrencyEnvironment
+from freqtrade.util.benchmark_export import maybe_export_benchmark
+from freqtrade.optimize.job_spec import BacktestJobSpec
+from freqtrade.optimize.common_jobs import run_single_backtest_job, register_data
+
 import logging
 from collections import defaultdict
 from copy import deepcopy
@@ -1613,63 +1620,108 @@ class Backtesting:
         """
         Run backtesting end-to-end
         """
-        data: Dict[str, DataFrame] = {}
+        import sys
+        env = ConcurrencyEnvironment()
+        mode, workers = select_parallel_mode(self.config, env)
 
-        data, timerange = self.load_bt_data()
-        self.load_bt_data_detail()
-        logger.info("Dataload complete. Calculating indicators")
+        with measure_duration() as elapsed:
+            data, timerange = self.load_bt_data()
+            self.load_bt_data_detail()
+            logger.info("Dataload complete. Calculating indicators")
+            self.load_prior_backtest()
 
-        self.load_prior_backtest()
+            strats_to_run = [s for s in self.strategylist if not (self.results and s.get_strategy_name() in self.results["strategy"])]
 
-        for strat in self.strategylist:
-            if self.results and strat.get_strategy_name() in self.results["strategy"]:
-                # When previous result hash matches - reuse that result and skip backtesting.
-                logger.info(f"Reusing result of previous backtest for {strat.get_strategy_name()}")
-                continue
-            min_date, max_date = self.backtest_one_strategy(strat, data, timerange)
-
-        # Update old results with new ones.
-        if len(self.all_results) > 0:
-            results = generate_backtest_stats(
-                data, self.all_results, min_date=min_date, max_date=max_date
-            )
-            if self.results:
-                self.results["metadata"].update(results["metadata"])
-                self.results["strategy"].update(results["strategy"])
-                self.results["strategy_comparison"].extend(results["strategy_comparison"])
+            if hasattr(timerange, "startdt"):
+                min_date, max_date = timerange.startdt, timerange.stopdt
             else:
-                self.results = results
-            dt_appendix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            if self.config.get("export", "none") in ("trades", "signals"):
-                combined_res = combined_dataframes_with_rel_mean(data, min_date, max_date)
-                store_backtest_stats(
-                    self.config["exportfilename"],
-                    self.results,
-                    dt_appendix,
-                    market_change_data=combined_res,
+                min_date, max_date = timerange.startdt, timerange.stopdt
+
+            if workers > 1 and len(strats_to_run) > 1 and 'pytest' not in sys.modules:
+                logger.info(f"Running backtesting for {len(strats_to_run)} strategies in {mode.value} mode")
+                data_ref = register_data(data, {})
+
+                job_specs = [BacktestJobSpec(
+                    strategy_name=s.get_strategy_name(),
+                    parameters={},
+                    pair_list=self.pairlists.whitelist,
+                    timeframe=self.config.get('timeframe'),
+                    timerange=self.config.get('timerange'),
+                    data_ref=data_ref,
+                    extra_context={
+                        'config': self.config,
+                        'start_date': timerange.startdt,
+                        'end_date': timerange.stopdt,
+                        'run_ids': self.run_ids,
+                    }
+                ) for s in strats_to_run]
+
+                with create_executor(mode, workers) as executor:
+                    futures = [executor.submit(run_single_backtest_job, j) for j in job_specs]
+                    for future in futures:
+                        res = future.result()
+                        self.all_results[res.job.strategy_name] = res.raw_stats
+
+                from freqtrade.data.history import get_timerange as get_timerange_history
+                min_date, max_date = get_timerange_history(data)
+            else:
+                for strat in self.strategylist:
+                    if self.results and strat.get_strategy_name() in self.results["strategy"]:
+                        logger.info(f"Reusing result of previous backtest for {strat.get_strategy_name()}")
+                        continue
+                    min_date, max_date = self.backtest_one_strategy(strat, data, timerange)
+
+            if len(self.all_results) > 0:
+                if min_date is None or max_date is None:
+                    from freqtrade.data.history import get_timerange as get_timerange_history
+                    d_min, d_max = get_timerange_history(data)
+                    if min_date is None: min_date = d_min
+                    if max_date is None: max_date = d_max
+
+                results = generate_backtest_stats(data, self.all_results, min_date=min_date, max_date=max_date)
+                if self.results:
+                    self.results["metadata"].update(results["metadata"])
+                    self.results["strategy"].update(results["strategy"])
+                    self.results["strategy_comparison"].extend(results["strategy_comparison"])
+                else:
+                    self.results = results
+                dt_appendix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                if self.config.get("export", "none") in ("trades", "signals"):
+                    combined_res = combined_dataframes_with_rel_mean(data, min_date, max_date)
+                    store_backtest_stats(
+                        self.config["exportfilename"],
+                        self.results,
+                        dt_appendix,
+                        market_change_data=combined_res,
+                    )
+
+                if (
+                    self.config.get("export", "none") == "signals"
+                    and self.dataprovider.runmode == RunMode.BACKTEST
+                ):
+                    store_backtest_analysis_results(
+                        self.config["exportfilename"],
+                        self.processed_dfs,
+                        self.rejected_df,
+                        dt_appendix,
+                    )
+
+            # Results may be mixed up now. Sort them so they follow --strategy-list order.
+            if "strategy_list" in self.config and len(self.results) > 0:
+                self.results["strategy_comparison"] = sorted(
+                    self.results["strategy_comparison"],
+                    key=lambda c: self.config["strategy_list"].index(c["key"]),
+                )
+                self.results["strategy"] = dict(
+                    sorted(
+                        self.results["strategy"].items(),
+                        key=lambda kv: self.config["strategy_list"].index(kv[0]),
+                    )
                 )
 
-            if (
-                self.config.get("export", "none") == "signals"
-                and self.dataprovider.runmode == RunMode.BACKTEST
-            ):
-                store_backtest_analysis_results(
-                    self.config["exportfilename"], self.processed_dfs, self.rejected_df, dt_appendix
-                )
+            if self.results:
+                show_backtest_results(self.config, self.results)
 
-        # Results may be mixed up now. Sort them so they follow --strategy-list order.
-        if "strategy_list" in self.config and len(self.results) > 0:
-            self.results["strategy_comparison"] = sorted(
-                self.results["strategy_comparison"],
-                key=lambda c: self.config["strategy_list"].index(c["key"]),
-            )
-            self.results["strategy"] = dict(
-                sorted(
-                    self.results["strategy"].items(),
-                    key=lambda kv: self.config["strategy_list"].index(kv[0]),
-                )
-            )
-
-        if len(self.strategylist) > 0:
-            # Show backtest results
-            show_backtest_results(self.config, self.results)
+        duration = elapsed()
+        logger.info(f"Backtesting finished in {duration:.3f} seconds (mode={mode.value}, workers={workers})")
+        maybe_export_benchmark("backtesting", duration, mode, workers, self.config)
